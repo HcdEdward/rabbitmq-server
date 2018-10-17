@@ -31,12 +31,12 @@
          are_supported_remotely/2,
          is_enabled/1,
          info/0,
-
          init/0,
          check_node_compatibility/1,
          check_node_compatibility/2,
          is_node_compatible/1,
-         is_node_compatible/2
+         is_node_compatible/2,
+         check_or_enable_boot_step/0
         ]).
 
 %% Internal use only.
@@ -44,7 +44,7 @@
          mark_as_enabled_locally/1]).
 
 %% Default timeout for operations on remote nodes.
--define(TIMEOUT, infinity).
+-define(TIMEOUT, 60000).
 
 list() -> list(all).
 
@@ -64,6 +64,9 @@ list(Which, Stability)
                 end, list(Which)).
 
 enable(FeatureName) ->
+    enable(FeatureName, all_nodes).
+
+enable(FeatureName, WhichNodes) ->
     rabbit_log:info("Feature flag `~s`: request to enable",
                     [FeatureName]),
     case is_enabled(FeatureName) of
@@ -82,7 +85,7 @@ enable(FeatureName) ->
                     rabbit_log:info("Feature flag `~s`: supported, "
                                     "attempt to enable...",
                                     [FeatureName]),
-                    do_enable(FeatureName);
+                    do_enable(FeatureName, WhichNodes);
                 false ->
                     rabbit_log:info("Feature flag `~s`: not supported",
                                     [FeatureName]),
@@ -347,13 +350,13 @@ enabled_feature_flags_list_file() ->
 %% Feature flags management: enabling.
 %% -------------------------------------------------------------------
 
-do_enable(FeatureName) ->
+do_enable(FeatureName, WhichNodes) ->
     #{FeatureName := FeatureProps} = rabbit_ff_registry:list(all),
     DependsOn = maps:get(depends_on, FeatureProps, []),
     rabbit_log:info("Feature flag `~s`: enable dependencies: ~p",
                     [FeatureName, DependsOn]),
     case enable_dependencies(FeatureName, DependsOn) of
-        ok    -> run_migration_fun(FeatureName, FeatureProps, enable);
+        ok    -> run_migration_fun(FeatureName, FeatureProps, enable, WhichNodes);
         Error -> Error
     end.
 
@@ -365,7 +368,7 @@ enable_dependencies(TopLevelFeatureName, [FeatureName | Rest]) ->
 enable_dependencies(_, []) ->
     ok.
 
-run_migration_fun(FeatureName, FeatureProps, Arg) ->
+run_migration_fun(FeatureName, FeatureProps, Arg, WhichNodes) ->
     case maps:get(migration_fun, FeatureProps, none) of
         {MigrationMod, MigrationFun}
           when is_atom(MigrationMod) andalso is_atom(MigrationFun) ->
@@ -374,7 +377,7 @@ run_migration_fun(FeatureName, FeatureProps, Arg) ->
                             [FeatureName, MigrationFun, Arg]),
             try
                 case erlang:apply(MigrationMod, MigrationFun, [Arg]) of
-                    ok    -> mark_as_enabled(FeatureName);
+                    ok    -> mark_as_enabled(FeatureName, WhichNodes);
                     Error -> Error
                 end
             catch
@@ -385,7 +388,7 @@ run_migration_fun(FeatureName, FeatureProps, Arg) ->
                     {error, {migration_fun_crash, Reason, Stacktrace}}
             end;
         none ->
-            mark_as_enabled(FeatureName);
+            mark_as_enabled(FeatureName, WhichNodes);
         Invalid ->
             rabbit_log:error("Feature flag `~s`: invalid migration "
                              "function: ~p",
@@ -393,9 +396,13 @@ run_migration_fun(FeatureName, FeatureProps, Arg) ->
             {error, {invalid_migration_fun, Invalid}}
     end.
 
-mark_as_enabled(FeatureName) ->
-    ok = mark_as_enabled_locally(FeatureName),
-    ok = mark_as_enabled_remotely(FeatureName).
+mark_as_enabled(FeatureName, local_node) ->
+    ok = mark_as_enabled_locally(FeatureName);
+mark_as_enabled(FeatureName, remote_nodes) ->
+    ok = mark_as_enabled_remotely(FeatureName);
+mark_as_enabled(FeatureName, all_nodes) ->
+    ok = mark_as_enabled(FeatureName, local_node),
+    ok = mark_as_enabled(FeatureName, remote_nodes).
 
 mark_as_enabled_locally(FeatureName) ->
     rabbit_log:info("Feature flag `~s`: mark as enabled",
@@ -486,6 +493,50 @@ is_node_compatible(Node) ->
 
 is_node_compatible(Node, Timeout) ->
     check_node_compatibility(Node, Timeout) =:= ok.
+
+check_or_enable_boot_step() ->
+    AvailableFeatures = list(),
+    AvailableFeatureNames = maps:keys(AvailableFeatures),
+    maybe_enable_features_locally(are_supported(AvailableFeatureNames)).
+
+maybe_enable_features_locally(true) ->
+    Nodes = running_remote_nodes(),
+    query_remote_node_and_enable_locally(Nodes);
+maybe_enable_features_locally(false) ->
+    rabbit_log:error("Feature flags: this node (~s) "
+                     "is not compatible with all remote nodes", [node()]),
+    {error, feature_flag_incompatibility}.
+
+query_remote_node_and_enable_locally([]) ->
+    ok;
+query_remote_node_and_enable_locally(Nodes) ->
+    Idx = rand:uniform(length(Nodes), Nodes),
+	Node = lists:nth(Idx, Nodes),
+    case rpc:call(Node, ?MODULE, list, [enabled], ?TIMEOUT) of
+        {badrpc, Reason} ->
+            ErrMsg = io_lib:format("Feature flags: error while querying "
+                                   "enabled feature flags on node `~s`: ~p",
+                                   [Node, Reason]),
+            rabbit_log:error(ErrMsg),
+            % TODO better error to catch during boot up
+            {error, {feature_flags, ErrMsg}};
+        RemoteEnabledFeatureFlags when is_map(RemoteEnabledFeatureFlags) ->
+        RemoteEnabledFeatureNames = maps:keys(RemoteEnabledFeatureFlags),
+        rabbit_log:info("Feature flags: querying enabled feature flags "
+                        "on node `~s` done; locally enabling features: ~p",
+                        [Node, RemoteEnabledFeatureNames]),
+        enable_features_locally(RemoteEnabledFeatureNames)
+    end.
+
+enable_features_locally([]) ->
+    ok;
+enable_features_locally([FeatureName | Rest]) ->
+    case enable(FeatureName, local_node) of
+        ok ->
+            enable_features_locally(Rest);
+        {error, _Reason} = Error ->
+            Error
+    end.
 
 local_enabled_feature_flags_are_supported_remotely(Node, Timeout) ->
     LocalEnabledFeatureNames = maps:keys(list(enabled)),

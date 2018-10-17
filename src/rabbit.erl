@@ -67,7 +67,15 @@
                    [{description, "feature flags registry and initial state"},
                     {mfa,         {rabbit_feature_flags, init, []}},
                     {requires,    pre_boot},
-                    {enables,     external_infrastructure}]}).
+                    {enables,     enable_feature_flags}]}).
+
+-rabbit_boot_step({enable_feature_flags,
+                   [{description, "check and/or enable feature flags"},
+                    {mfa,         {rabbit_feature_flags,
+                                   check_or_enable_boot_step,
+                                   []}},
+                    {requires,    [feature_flags]},
+                    {enables,     code_server_cache}]}).
 
 -rabbit_boot_step({database,
                    [{mfa,         {rabbit_mnesia, init, []}},
